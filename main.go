@@ -1,479 +1,418 @@
+// Package main provides a test application to verify the auto-detect-noisy-field functionality in Keploy.
+// This application exposes various API endpoints that return different types of noisy fields
+// including timestamps, UUIDs, KSUIDs, ULIDs, MongoDB ObjectIDs, Snowflake IDs, and more.
 package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"log"
-	math_rand "math/rand"
+	"math/rand"
 	"net/http"
-	"os"
-	"strings"
-	"sync"
+	"strconv"
 	"time"
 
-	"github.com/araddon/dateparse"
 	"github.com/google/uuid"
 	"github.com/oklog/ulid/v2"
 	"github.com/segmentio/ksuid"
 )
 
-// ============================================================================
-// DATA MODELS
-// ============================================================================
+// Response structures for various test cases
 
-// User represents a user profile with account information
-// Field Types:
-// - accountNumber: TEMPLATIZED BUT NOT NOISY (stable identifier)
-// - userId: TEMPLATIZED AND NOISY (UUID changes each run)
-// - sessionId, uuidV4, ulidId, ksuidId: NOISY BUT NOT TEMPLATIZED (library-generated IDs)
-// - createdAt, requestId, processingTimeMs, serverTimestamp, parsedTimestamp: NOISY BUT NOT TEMPLATIZED
-// - name, email: STABLE FIELDS (exact assertions)
-type User struct {
-	AccountNumber    string    `json:"accountNumber"`    // TEMPLATIZED BUT NOT NOISY
-	UserID           string    `json:"userId"`           // TEMPLATIZED AND NOISY
-	Name             string    `json:"name"`             // STABLE FIELD
-	Email            string    `json:"email"`            // STABLE FIELD
-	SessionID        string    `json:"sessionId"`        // NOISY BUT NOT TEMPLATIZED (raw UUID)
-	UUIDV4           string    `json:"uuidV4"`           // NOISY BUT NOT TEMPLATIZED (google/uuid)
-	ULIDID           string    `json:"ulidId"`           // NOISY BUT NOT TEMPLATIZED (oklog/ulid)
-	KSUIDID          string    `json:"ksuidId"`          // NOISY BUT NOT TEMPLATIZED (segmentio/ksuid)
-	CreatedAt        time.Time `json:"createdAt"`        // NOISY BUT NOT TEMPLATIZED
-	ParsedTimestamp  string    `json:"parsedTimestamp"`  // NOISY BUT NOT TEMPLATIZED (dateparse)
-	RequestID        string    `json:"requestId"`        // NOISY BUT NOT TEMPLATIZED
-	ProcessingTimeMs int64     `json:"processingTimeMs"` // NOISY BUT NOT TEMPLATIZED
-	ServerTimestamp  string    `json:"serverTimestamp"`  // NOISY BUT NOT TEMPLATIZED
+// TimestampResponse contains various timestamp formats for testing
+type TimestampResponse struct {
+	RFC3339    string `json:"rfc3339"`
+	RFC1123    string `json:"rfc1123"`
+	UnixDate   string `json:"unix_date"`
+	ISO8601    string `json:"iso8601"`
+	CustomDate string `json:"custom_date"`
+	UnixNano   int64  `json:"unix_nano"`
+	StaticName string `json:"static_name"` // Should NOT be detected as noisy
 }
 
-// Order represents a customer order
-// Field Types:
-// - orderId: TEMPLATIZED AND NOISY (changes per order)
-// - accountNumber: TEMPLATIZED BUT NOT NOISY (reused from user)
-// - sessionId, uuidV4, ulidId, ksuidId: NOISY BUT NOT TEMPLATIZED (library-generated IDs)
-// - amount, status, items: STABLE FIELDS
-// - createdAt, requestId, processingTimeMs, transactionHash, serverTimestamp, parsedTimestamp: NOISY BUT NOT TEMPLATIZED
-type Order struct {
-	OrderID          string    `json:"orderId"`          // TEMPLATIZED AND NOISY
-	AccountNumber    string    `json:"accountNumber"`    // TEMPLATIZED BUT NOT NOISY
-	Amount           float64   `json:"amount"`           // STABLE FIELD
-	Status           string    `json:"status"`           // STABLE FIELD
-	Items            []string  `json:"items"`            // STABLE FIELD
-	SessionID        string    `json:"sessionId"`        // NOISY BUT NOT TEMPLATIZED (raw UUID)
-	UUIDV4           string    `json:"uuidV4"`           // NOISY BUT NOT TEMPLATIZED (google/uuid)
-	ULIDID           string    `json:"ulidId"`           // NOISY BUT NOT TEMPLATIZED (oklog/ulid)
-	KSUIDID          string    `json:"ksuidId"`          // NOISY BUT NOT TEMPLATIZED (segmentio/ksuid)
-	CreatedAt        time.Time `json:"createdAt"`        // NOISY BUT NOT TEMPLATIZED
-	ParsedTimestamp  string    `json:"parsedTimestamp"`  // NOISY BUT NOT TEMPLATIZED (dateparse)
-	RequestID        string    `json:"requestId"`        // NOISY BUT NOT TEMPLATIZED
-	ProcessingTimeMs int64     `json:"processingTimeMs"` // NOISY BUT NOT TEMPLATIZED
-	TransactionHash  string    `json:"transactionHash"`  // NOISY BUT NOT TEMPLATIZED
-	ServerTimestamp  string    `json:"serverTimestamp"`  // NOISY BUT NOT TEMPLATIZED
+// UUIDResponse contains UUID fields for testing
+type UUIDResponse struct {
+	ID          string `json:"id"`
+	SessionID   string `json:"session_id"`
+	RequestID   string `json:"request_id"`
+	StaticField string `json:"static_field"` // Should NOT be detected as noisy
 }
 
-// Health represents health check response (control endpoint)
-type Health struct {
-	Status string `json:"status"` // STABLE FIELD
+// RandomIDResponse contains various random ID formats for testing
+type RandomIDResponse struct {
+	KSUID      string `json:"ksuid"`
+	ULID       string `json:"ulid"`
+	ObjectID   string `json:"object_id"`   // MongoDB ObjectID format (24 hex chars)
+	SnowflakeID string `json:"snowflake_id"` // 18-19 digit number
+	NanoID     string `json:"nano_id"`     // 21-22 char alphanumeric with _-
+	StaticVal  string `json:"static_val"`  // Should NOT be detected as noisy
 }
 
-// ============================================================================
-// REQUEST/RESPONSE MODELS
-// ============================================================================
-
-// CreateUserRequest for POST /users
-type CreateUserRequest struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
+// PrefixedIDResponse contains prefixed hex strings for testing
+type PrefixedIDResponse struct {
+	EncryptionKey string `json:"encryption_key"` // enc_<hex>
+	TokenID       string `json:"token_id"`       // token_<hex>
+	UserID        string `json:"user_id"`        // id_<hex>
+	RegularText   string `json:"regular_text"`   // Should NOT be detected as noisy
 }
 
-// CreateOrderRequest for POST /orders
-// IMPORTANT: accountNumber in request creates producer-consumer chain
-type CreateOrderRequest struct {
-	AccountNumber string   `json:"accountNumber"` // CONSUMER (from POST /users)
-	Amount        float64  `json:"amount"`
-	Items         []string `json:"items"`
+// HashResponse contains hash/token fields for testing
+type HashResponse struct {
+	SHA256Hash    string `json:"sha256_hash"`    // 64 hex chars
+	APIKey        string `json:"api_key"`        // Base64-like token
+	SessionToken  string `json:"session_token"`  // 32 hex chars
+	RegularString string `json:"regular_string"` // Should NOT be detected as noisy
 }
 
-// ErrorResponse for error cases
-type ErrorResponse struct {
-	Error string `json:"error"`
+// NestedResponse contains nested objects with noisy fields
+type NestedResponse struct {
+	Data struct {
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		ID        string `json:"id"`
+		Title     string `json:"title"` // Should NOT be detected as noisy
+	} `json:"data"`
+	Meta struct {
+		RequestID   string `json:"request_id"`
+		TraceID     string `json:"trace_id"`
+		ServiceName string `json:"service_name"` // Should NOT be detected as noisy
+	} `json:"meta"`
 }
 
-// ============================================================================
-// IN-MEMORY STORAGE
-// ============================================================================
-
-var (
-	// User storage: key = accountNumber
-	userStore = make(map[string]User)
-
-	// Order storage: key = orderId
-	orderStore = make(map[string]Order)
-
-	// Counters for generating IDs
-	accountCounter = 0
-	orderCounter   = 0
-
-	// Thread-safe mutex
-	storeMutex sync.RWMutex
-)
-
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-// generateAccountNumber creates stable account numbers like "ACC-00000001"
-// This is TEMPLATIZED BUT NOT NOISY - format is consistent
-func generateAccountNumber() string {
-	storeMutex.Lock()
-	defer storeMutex.Unlock()
-	accountCounter++
-	return fmt.Sprintf("ACC-%08d", accountCounter)
+// ArrayResponse contains arrays with noisy fields
+type ArrayResponse struct {
+	IDs        []string `json:"ids"`
+	Timestamps []string `json:"timestamps"`
+	Names      []string `json:"names"` // Should NOT be detected as noisy
 }
 
-// generateOrderID creates order IDs like "ORD-00000001"
-// This is TEMPLATIZED AND NOISY - changes for each order
-func generateOrderID() string {
-	storeMutex.Lock()
-	defer storeMutex.Unlock()
-	orderCounter++
-	return fmt.Sprintf("ORD-%08d", orderCounter)
+// MixedResponse contains a mix of noisy and non-noisy fields
+type MixedResponse struct {
+	ID            string  `json:"id"`              // UUID - noisy
+	Name          string  `json:"name"`            // static - NOT noisy
+	Email         string  `json:"email"`           // static - NOT noisy
+	Age           int     `json:"age"`             // static - NOT noisy
+	CreatedAt     string  `json:"created_at"`      // timestamp - noisy
+	Balance       float64 `json:"balance"`         // static - NOT noisy
+	RequestID     string  `json:"request_id"`      // KSUID - noisy
+	PhoneNumber   string  `json:"phone_number"`    // NOT noisy
+	IPAddress     string  `json:"ip_address"`      // NOT noisy
 }
 
-// generateRequestID creates unique request IDs like "REQ-uuid"
-// This is NOISY BUT NOT TEMPLATIZED - changes every request
-func generateRequestID() string {
-	return fmt.Sprintf("REQ-%s", uuid.NewString())
+// EdgeCaseResponse tests edge cases and boundary conditions
+type EdgeCaseResponse struct {
+	EmptyString      string `json:"empty_string"`
+	ShortString      string `json:"short_string"`
+	LongNormalString string `json:"long_normal_string"`
+	PartialUUID      string `json:"partial_uuid"`       // Should be detected as hex-like
+	AlmostTimestamp  string `json:"almost_timestamp"`   // Should NOT be detected
+	NumberString     string `json:"number_string"`      // Should NOT be detected
+	URLString        string `json:"url_string"`         // Should NOT be detected
+	EmailString      string `json:"email_string"`       // Should NOT be detected
 }
 
-// generateTransactionHash creates a fake hash for orders
-// This is NOISY BUT NOT TEMPLATIZED - unique per transaction
-func generateTransactionHash() string {
-	return fmt.Sprintf("TXN-%s", uuid.NewString()[:16])
+// generateObjectID generates a MongoDB-like ObjectID (24 hex chars)
+func generateObjectID() string {
+	timestamp := uint32(time.Now().Unix())
+	counter := rand.Uint32()
+	return fmt.Sprintf("%08x%04x%04x%08x", timestamp, rand.Intn(0xFFFF), rand.Intn(0xFFFF), counter)
 }
 
-// getServerTimestamp returns current server time in RFC3339 format
-// This is NOISY BUT NOT TEMPLATIZED - changes every call
-func getServerTimestamp() string {
-	return time.Now().UTC().Format(time.RFC3339)
+// generateSnowflakeID generates a Twitter Snowflake-like ID (18-19 digits)
+func generateSnowflakeID() string {
+	epoch := int64(1288834974657) // Twitter Snowflake epoch
+	timestamp := (time.Now().UnixMilli() - epoch) << 22
+	sequence := rand.Int63n(4096)
+	workerId := int64(rand.Intn(32)) << 12
+	datacenterId := int64(rand.Intn(32)) << 17
+	snowflake := timestamp | datacenterId | workerId | sequence
+	return strconv.FormatInt(snowflake, 10)
 }
 
-// generateUUIDV4 generates a UUID v4 using google/uuid library
-// This is NOISY BUT NOT TEMPLATIZED - raw UUID from library
-func generateUUIDV4() string {
-	return uuid.New().String()
-}
-
-// generateULID generates a ULID using oklog/ulid library
-// This is NOISY BUT NOT TEMPLATIZED - time-sortable unique ID
-func generateULID() string {
-	entropy := ulid.Monotonic(math_rand.New(math_rand.NewSource(time.Now().UnixNano())), 0)
-	return ulid.MustNew(ulid.Timestamp(time.Now()), entropy).String()
-}
-
-// generateKSUID generates a KSUID using segmentio/ksuid library
-// This is NOISY BUT NOT TEMPLATIZED - K-Sortable Unique Identifier
-func generateKSUID() string {
-	return ksuid.New().String()
-}
-
-// parseAndFormatTimestamp demonstrates dateparse library usage
-// This is NOISY BUT NOT TEMPLATIZED - parses and reformats current time
-func parseAndFormatTimestamp() string {
-	// Generate a timestamp string in various formats and parse it back
-	timeStr := time.Now().UTC().Format("2006-01-02 15:04:05")
-	parsed, err := dateparse.ParseAny(timeStr)
-	if err != nil {
-		return time.Now().UTC().Format(time.RFC3339Nano)
+// generateNanoID generates a NanoID-like string (21 chars)
+func generateNanoID() string {
+	alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+	b := make([]byte, 21)
+	for i := range b {
+		b[i] = alphabet[rand.Intn(len(alphabet))]
 	}
-	return parsed.Format(time.RFC3339Nano)
+	return string(b)
 }
 
-// writeJSON is a helper to write JSON responses consistently
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("Error encoding JSON response: %v", err)
+// generateSHA256 generates a SHA256-like hash (64 hex chars)
+func generateSHA256() string {
+	const hexChars = "0123456789abcdef"
+	b := make([]byte, 64)
+	for i := range b {
+		b[i] = hexChars[rand.Intn(16)]
 	}
+	return string(b)
 }
 
-// ============================================================================
-// MAIN FUNCTION
-// ============================================================================
+// generateAPIKey generates a base64-like API key
+func generateAPIKey() string {
+	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+	b := make([]byte, 40)
+	for i := range b {
+		b[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(b)
+}
+
+// generateSessionToken generates a 32-char hex token
+func generateSessionToken() string {
+	const hexChars = "0123456789abcdef"
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = hexChars[rand.Intn(16)]
+	}
+	return string(b)
+}
 
 func main() {
-	mux := http.NewServeMux()
+	rand.Seed(time.Now().UnixNano())
 
-	// ========================================================================
-	// ENDPOINT 1: POST /users - Create User Profile (PRODUCER)
-	// ========================================================================
-	// Produces: accountNumber (templatized, stable), userId (templatized, noisy)
-	// Also includes: requestId, processingTimeMs, serverTimestamp (noisy, not templatized)
-	mux.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req CreateUserRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
-			return
-		}
-
-		// Validate required fields
-		if req.Name == "" || req.Email == "" {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "name and email are required"})
-			return
-		}
-
-		// Create new user profile with noisy fields
-		user := User{
-			AccountNumber:    generateAccountNumber(),              // TEMPLATIZED BUT NOT NOISY
-			UserID:           uuid.NewString(),                     // TEMPLATIZED AND NOISY
-			Name:             req.Name,                             // STABLE FIELD
-			Email:            req.Email,                            // STABLE FIELD
-			SessionID:        uuid.NewString(),                     // NOISY BUT NOT TEMPLATIZED (raw UUID)
-			UUIDV4:           generateUUIDV4(),                     // NOISY BUT NOT TEMPLATIZED (google/uuid)
-			ULIDID:           generateULID(),                       // NOISY BUT NOT TEMPLATIZED (oklog/ulid)
-			KSUIDID:          generateKSUID(),                      // NOISY BUT NOT TEMPLATIZED (segmentio/ksuid)
-			CreatedAt:        time.Now().UTC(),                     // NOISY BUT NOT TEMPLATIZED
-			ParsedTimestamp:  parseAndFormatTimestamp(),            // NOISY BUT NOT TEMPLATIZED (dateparse)
-			RequestID:        generateRequestID(),                  // NOISY BUT NOT TEMPLATIZED
-			ProcessingTimeMs: time.Since(startTime).Milliseconds(), // NOISY BUT NOT TEMPLATIZED
-			ServerTimestamp:  getServerTimestamp(),                 // NOISY BUT NOT TEMPLATIZED
-		}
-
-		// Store user by accountNumber
-		storeMutex.Lock()
-		userStore[user.AccountNumber] = user
-		storeMutex.Unlock()
-
-		log.Printf("Created user: AccountNumber=%s, UserID=%s, SessionID=%s, UUIDV4=%s, ULID=%s, KSUID=%s, RequestID=%s, ProcessingTime=%dms",
-			user.AccountNumber, user.UserID, user.SessionID, user.UUIDV4, user.ULIDID, user.KSUIDID, user.RequestID, user.ProcessingTimeMs)
-
-		// NO X-Request-Id header per requirements - only Content-Type
+	// Test Case 1: Timestamps in various formats
+	http.HandleFunc("/timestamps", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, http.StatusCreated, user)
+		w.Header().Set("Date", time.Now().Format(time.RFC1123)) // Header timestamp - should be noisy
+		w.Header().Set("X-Request-Time", time.Now().Format(time.RFC3339))
+		
+		resp := TimestampResponse{
+			RFC3339:    time.Now().Format(time.RFC3339),
+			RFC1123:    time.Now().Format(time.RFC1123),
+			UnixDate:   time.Now().Format(time.UnixDate),
+			ISO8601:    time.Now().Format("2006-01-02"),
+			CustomDate: time.Now().Format("Mon, 02 Jan 2006 15:04:05 MST"),
+			UnixNano:   time.Now().UnixNano(),
+			StaticName: "This is a static value",
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 
-	// ========================================================================
-	// ENDPOINT 2: POST /orders - Create Order (CONSUMER + PRODUCER)
-	// ========================================================================
-	// Consumes: accountNumber (from POST /users)
-	// Produces: orderId (templatized, noisy for each order)
-	// Also includes: requestId, processingTimeMs, transactionHash, serverTimestamp (noisy, not templatized)
-	mux.HandleFunc("/orders", func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var req CreateOrderRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body"})
-			return
-		}
-
-		// Validate required fields
-		if req.AccountNumber == "" || req.Amount <= 0 || len(req.Items) == 0 {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "accountNumber, amount, and items are required"})
-			return
-		}
-
-		// Verify accountNumber exists (validates producer-consumer chain)
-		storeMutex.RLock()
-		_, exists := userStore[req.AccountNumber]
-		storeMutex.RUnlock()
-
-		if !exists {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "account not found"})
-			return
-		}
-
-		// Create new order with noisy fields
-		order := Order{
-			OrderID:          generateOrderID(),                    // TEMPLATIZED AND NOISY
-			AccountNumber:    req.AccountNumber,                    // TEMPLATIZED BUT NOT NOISY
-			Amount:           req.Amount,                           // STABLE FIELD
-			Status:           "PENDING",                            // STABLE FIELD
-			Items:            req.Items,                            // STABLE FIELD
-			SessionID:        uuid.NewString(),                     // NOISY BUT NOT TEMPLATIZED (raw UUID)
-			UUIDV4:           generateUUIDV4(),                     // NOISY BUT NOT TEMPLATIZED (google/uuid)
-			ULIDID:           generateULID(),                       // NOISY BUT NOT TEMPLATIZED (oklog/ulid)
-			KSUIDID:          generateKSUID(),                      // NOISY BUT NOT TEMPLATIZED (segmentio/ksuid)
-			CreatedAt:        time.Now().UTC(),                     // NOISY BUT NOT TEMPLATIZED
-			ParsedTimestamp:  parseAndFormatTimestamp(),            // NOISY BUT NOT TEMPLATIZED (dateparse)
-			RequestID:        generateRequestID(),                  // NOISY BUT NOT TEMPLATIZED
-			ProcessingTimeMs: time.Since(startTime).Milliseconds(), // NOISY BUT NOT TEMPLATIZED
-			TransactionHash:  generateTransactionHash(),            // NOISY BUT NOT TEMPLATIZED
-			ServerTimestamp:  getServerTimestamp(),                 // NOISY BUT NOT TEMPLATIZED
-		}
-
-		// Store order by orderId
-		storeMutex.Lock()
-		orderStore[order.OrderID] = order
-		storeMutex.Unlock()
-
-		log.Printf("Created order: OrderID=%s, AccountNumber=%s, SessionID=%s, UUIDV4=%s, ULID=%s, KSUID=%s, RequestID=%s, TxHash=%s, ProcessingTime=%dms",
-			order.OrderID, order.AccountNumber, order.SessionID, order.UUIDV4, order.ULIDID, order.KSUIDID, order.RequestID, order.TransactionHash, order.ProcessingTimeMs)
-
+	// Test Case 2: UUIDs
+	http.HandleFunc("/uuids", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, http.StatusCreated, order)
+		w.Header().Set("X-Request-ID", uuid.New().String()) // Header UUID - should be noisy
+		
+		resp := UUIDResponse{
+			ID:          uuid.New().String(),
+			SessionID:   uuid.New().String(),
+			RequestID:   uuid.New().String(),
+			StaticField: "static-value-not-uuid",
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 
-	// ========================================================================
-	// ENDPOINT 3: GET /orders/{orderId} - Get Order Details (CONSUMER)
-	// ========================================================================
-	// Consumes: orderId (from POST /orders)
-	// Shows: accountNumber linked to this order
-	// Fresh noisy fields generated for each GET request
-	mux.HandleFunc("/orders/", func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Extract orderId from path
-		orderId := strings.TrimPrefix(r.URL.Path, "/orders/")
-		if orderId == "" {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "order id required"})
-			return
-		}
-
-		// Retrieve order
-		storeMutex.RLock()
-		order, exists := orderStore[orderId]
-		storeMutex.RUnlock()
-
-		if !exists {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "order not found"})
-			return
-		}
-
-		// Add fresh noisy fields for this GET request
-		order.SessionID = uuid.NewString()                // NEW session ID for this GET
-		order.UUIDV4 = generateUUIDV4()                   // NEW UUID for this GET
-		order.ULIDID = generateULID()                     // NEW ULID for this GET
-		order.KSUIDID = generateKSUID()                   // NEW KSUID for this GET
-		order.ParsedTimestamp = parseAndFormatTimestamp() // NEW parsed timestamp for this GET
-		order.RequestID = generateRequestID()             // NEW request ID for this GET
-		order.ProcessingTimeMs = time.Since(startTime).Milliseconds()
-		order.ServerTimestamp = getServerTimestamp()
-
-		log.Printf("Retrieved order: OrderID=%s, AccountNumber=%s, SessionID=%s, UUIDV4=%s, ULID=%s, KSUID=%s, RequestID=%s",
-			order.OrderID, order.AccountNumber, order.SessionID, order.UUIDV4, order.ULIDID, order.KSUIDID, order.RequestID)
-
+	// Test Case 3: Various Random ID formats (KSUID, ULID, ObjectID, Snowflake, NanoID)
+	http.HandleFunc("/random-ids", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, http.StatusOK, order)
+		w.Header().Set("X-Trace-ID", ksuid.New().String()) // Header KSUID - should be noisy
+		
+		resp := RandomIDResponse{
+			KSUID:       ksuid.New().String(),
+			ULID:        ulid.Make().String(),
+			ObjectID:    generateObjectID(),
+			SnowflakeID: generateSnowflakeID(),
+			NanoID:      generateNanoID(),
+			StaticVal:   "normal-static-value",
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 
-	// ========================================================================
-	// ENDPOINT 4: GET /users/{accountNumber} - Get User Profile (CONSUMER)
-	// ========================================================================
-	// Consumes: accountNumber (from POST /users)
-	// Fresh noisy fields generated for each GET request
-	mux.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Extract accountNumber from path
-		accountNumber := strings.TrimPrefix(r.URL.Path, "/users/")
-		if accountNumber == "" {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "account number required"})
-			return
-		}
-
-		// Retrieve user
-		storeMutex.RLock()
-		user, exists := userStore[accountNumber]
-		storeMutex.RUnlock()
-
-		if !exists {
-			w.Header().Set("Content-Type", "application/json")
-			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "user not found"})
-			return
-		}
-
-		// Add fresh noisy fields for this GET request
-		user.SessionID = uuid.NewString()                // NEW session ID for this GET
-		user.UUIDV4 = generateUUIDV4()                   // NEW UUID for this GET
-		user.ULIDID = generateULID()                     // NEW ULID for this GET
-		user.KSUIDID = generateKSUID()                   // NEW KSUID for this GET
-		user.ParsedTimestamp = parseAndFormatTimestamp() // NEW parsed timestamp for this GET
-		user.RequestID = generateRequestID()             // NEW request ID for this GET
-		user.ProcessingTimeMs = time.Since(startTime).Milliseconds()
-		user.ServerTimestamp = getServerTimestamp()
-
-		log.Printf("Retrieved user: AccountNumber=%s, SessionID=%s, UUIDV4=%s, ULID=%s, KSUID=%s, RequestID=%s",
-			user.AccountNumber, user.SessionID, user.UUIDV4, user.ULIDID, user.KSUIDID, user.RequestID)
-
+	// Test Case 4: Prefixed hex strings
+	http.HandleFunc("/prefixed-ids", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, http.StatusOK, user)
+		
+		resp := PrefixedIDResponse{
+			EncryptionKey: fmt.Sprintf("enc_%s", generateSessionToken()),
+			TokenID:       fmt.Sprintf("token_%s", generateSessionToken()),
+			UserID:        fmt.Sprintf("id_%s", generateSessionToken()),
+			RegularText:   "This is regular text content",
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 
-	// ========================================================================
-	// ENDPOINT 5: GET /health - Health Check (CONTROL)
-	// ========================================================================
-	// Control endpoint with no noisy fields - always returns stable response
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		h := Health{Status: "ok"} // STABLE FIELD only
-
+	// Test Case 5: Hash/Token fields
+	http.HandleFunc("/hashes", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(w, http.StatusOK, h)
+		w.Header().Set("X-Auth-Token", generateAPIKey()) // Header token - should be noisy
+		
+		resp := HashResponse{
+			SHA256Hash:    generateSHA256(),
+			APIKey:        generateAPIKey(),
+			SessionToken:  generateSessionToken(),
+			RegularString: "This is a regular string value",
+		}
+		json.NewEncoder(w).Encode(resp)
 	})
 
-	// ========================================================================
-	// SERVER CONFIGURATION
-	// ========================================================================
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	addr := ":" + port
+	// Test Case 6: Nested objects with noisy fields
+	http.HandleFunc("/nested", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		
+		resp := NestedResponse{}
+		resp.Data.CreatedAt = time.Now().Format(time.RFC3339)
+		resp.Data.UpdatedAt = time.Now().Add(time.Hour).Format(time.RFC3339)
+		resp.Data.ID = uuid.New().String()
+		resp.Data.Title = "Sample Title"
+		resp.Meta.RequestID = ksuid.New().String()
+		resp.Meta.TraceID = ulid.Make().String()
+		resp.Meta.ServiceName = "noisy-field-detector"
+		
+		json.NewEncoder(w).Encode(resp)
+	})
 
-	log.Printf("🚀 Starting E-Commerce Order System on %s", addr)
-	log.Printf("📋 Available endpoints:")
-	log.Printf("   POST   /users                - Create user profile")
-	log.Printf("   POST   /orders               - Create order")
-	log.Printf("   GET    /orders/{orderId}     - Get order details")
-	log.Printf("   GET    /users/{accountNumber} - Get user profile")
-	log.Printf("   GET    /health               - Health check")
-	log.Printf("")
-	log.Printf("🎯 Field Types Demonstrated:")
-	log.Printf("   - TEMPLATIZED BUT NOT NOISY: accountNumber")
-	log.Printf("   - TEMPLATIZED AND NOISY: userId, orderId")
-	log.Printf("   - NOISY BUT NOT TEMPLATIZED (Library-Generated):")
-	log.Printf("     * sessionId (uuid.NewString)")
-	log.Printf("     * uuidV4 (google/uuid)")
-	log.Printf("     * ulidId (oklog/ulid - time-sortable)")
-	log.Printf("     * ksuidId (segmentio/ksuid - K-Sortable UID)")
-	log.Printf("     * parsedTimestamp (araddon/dateparse)")
-	log.Printf("     * createdAt, requestId, processingTimeMs, transactionHash, serverTimestamp")
-	log.Printf("   - STABLE FIELDS: name, email, amount, status, items")
+	// Test Case 7: Arrays containing noisy fields
+	http.HandleFunc("/arrays", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		
+		resp := ArrayResponse{
+			IDs: []string{
+				uuid.New().String(),
+				uuid.New().String(),
+				uuid.New().String(),
+			},
+			Timestamps: []string{
+				time.Now().Format(time.RFC3339),
+				time.Now().Add(time.Hour).Format(time.RFC3339),
+			},
+			Names: []string{
+				"John",
+				"Jane",
+				"Bob",
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
 
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatal(err)
+	// Test Case 8: Mixed noisy and non-noisy fields
+	http.HandleFunc("/mixed", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Correlation-ID", uuid.New().String())
+		w.Header().Set("Content-Language", "en-US") // Should NOT be noisy
+		
+		resp := MixedResponse{
+			ID:          uuid.New().String(),
+			Name:        "John Doe",
+			Email:       "john.doe@example.com",
+			Age:         30,
+			CreatedAt:   time.Now().Format(time.RFC3339),
+			Balance:     1234.56,
+			RequestID:   ksuid.New().String(),
+			PhoneNumber: "+1-555-123-4567",
+			IPAddress:   "192.168.1.100",
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Test Case 9: Edge cases and boundary conditions
+	http.HandleFunc("/edge-cases", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		
+		resp := EdgeCaseResponse{
+			EmptyString:      "",
+			ShortString:      "abc",
+			LongNormalString: "The quick brown fox jumps over the lazy dog",
+			PartialUUID:      "550e8400-e29b-41d4-a716", // Partial UUID - might be detected as hex
+			AlmostTimestamp:  "not-a-date-2023",
+			NumberString:     "12345",
+			URLString:        "https://example.com/path",
+			EmailString:      "test@example.com",
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Test Case 10: Non-JSON body (plain text) with noisy content
+	http.HandleFunc("/plain-uuid", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", uuid.New().String())
+	})
+
+	// Test Case 11: Non-JSON body (plain text) with timestamp
+	http.HandleFunc("/plain-timestamp", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", time.Now().Format(time.RFC3339))
+	})
+
+	// Test Case 12: Non-JSON body (plain text) with non-noisy content
+	http.HandleFunc("/plain-text", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "This is a regular plain text response")
+	})
+
+	// Test Case 13: Empty response
+	http.HandleFunc("/empty", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Test Case 14: Headers only (no body)
+	http.HandleFunc("/headers-only", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-ID", uuid.New().String())
+		w.Header().Set("X-Timestamp", time.Now().Format(time.RFC3339))
+		w.Header().Set("X-Static-Header", "static-value")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Test Case 15: All noisy field types combined
+	http.HandleFunc("/all-noisy", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().Format(time.RFC1123))
+		w.Header().Set("X-Request-ID", uuid.New().String())
+		w.Header().Set("X-Trace-ID", ksuid.New().String())
+		
+		resp := map[string]interface{}{
+			"uuid":        uuid.New().String(),
+			"ksuid":       ksuid.New().String(),
+			"ulid":        ulid.Make().String(),
+			"object_id":   generateObjectID(),
+			"snowflake":   generateSnowflakeID(),
+			"nano_id":     generateNanoID(),
+			"timestamp":   time.Now().Format(time.RFC3339),
+			"sha256":      generateSHA256(),
+			"api_key":     generateAPIKey(),
+			"prefixed_id": fmt.Sprintf("enc_%s", generateSessionToken()),
+			"nested": map[string]interface{}{
+				"created_at": time.Now().Format(time.RFC3339),
+				"id":         uuid.New().String(),
+				"static":     "not-noisy-value",
+			},
+			"id_array": []string{
+				uuid.New().String(),
+				uuid.New().String(),
+			},
+			"static_field": "This is a static non-noisy field",
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Health check endpoint
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+	})
+
+	port := ":8080"
+	log.Printf("🚀 Noisy Field Detector Test Server starting on port %s", port)
+	log.Printf("📝 Available endpoints for testing noisy field detection:")
+	log.Printf("   GET /timestamps       - Various timestamp formats")
+	log.Printf("   GET /uuids            - UUID fields")
+	log.Printf("   GET /random-ids       - KSUID, ULID, ObjectID, Snowflake, NanoID")
+	log.Printf("   GET /prefixed-ids     - Prefixed hex strings (enc_, token_, id_)")
+	log.Printf("   GET /hashes           - SHA256, API keys, session tokens")
+	log.Printf("   GET /nested           - Nested objects with noisy fields")
+	log.Printf("   GET /arrays           - Arrays containing noisy fields")
+	log.Printf("   GET /mixed            - Mixed noisy and non-noisy fields")
+	log.Printf("   GET /edge-cases       - Edge cases and boundary conditions")
+	log.Printf("   GET /plain-uuid       - Plain text UUID body")
+	log.Printf("   GET /plain-timestamp  - Plain text timestamp body")
+	log.Printf("   GET /plain-text       - Plain text non-noisy body")
+	log.Printf("   GET /empty            - Empty response (204)")
+	log.Printf("   GET /headers-only     - Noisy headers, no body")
+	log.Printf("   GET /all-noisy        - All noisy field types combined")
+	log.Printf("   GET /health           - Health check")
+
+	if err := http.ListenAndServe(port, nil); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
 	}
 }
